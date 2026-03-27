@@ -4,7 +4,16 @@
       "Skill(claude-api)",
       "Bash(cd:*)",
       "Bash(npm uninstall:*)",
-      "Bash(npm install:*)"
+      "Bash(npm install:*)",
+      "Bash(node --check src/db/database.js)",
+      "Bash(node --check src/db/queries.js)",
+      "Bash(node --check src/scripts/analizar-chats.js)",
+      "Bash(node --check src/scripts/importar-historico.js)",
+      "Bash(node --check src/scheduler/reactivacionQueue.js)",
+      "Bash(node --check src/admin/panel.js)",
+      "Bash(node --check src/utils/pdfTelegrama.js)",
+      "Bash(node --check src/utils/pdfCartaPoder.js)",
+      "Bash(node src/scripts/seed-casos.js)"
     ]
   }
 }

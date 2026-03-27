@@ -3,9 +3,10 @@
 require('dotenv').config();
 
 const express = require('express');
-const webhookRouter = require('./src/webhooks');
-const adminRouter  = require('./src/admin/panel');
-const { startAllJobs } = require('./src/scheduler/cronJobs');
+const webhookRouter      = require('./src/webhooks');
+const adminRouter        = require('./src/admin/panel');
+const reactivacionRouter = require('./src/admin/reactivacion');
+const { startAllJobs }   = require('./src/scheduler/cronJobs');
 
 // Inicializar DB (ejecuta el schema al importar)
 require('./src/db/database');
@@ -31,6 +32,7 @@ app.get('/health', (req, res) => {
 // ─── Rutas ────────────────────────────────────────────────────────────────────
 
 app.use('/webhook', webhookRouter);
+app.use('/admin',   reactivacionRouter);
 app.use('/admin',   adminRouter);
 
 // ─── Endpoint de prueba (sin WhatsApp) ───────────────────────────────────────
@@ -45,20 +47,18 @@ app.post('/test', async (req, res) => {
   const queries = require('./src/db/queries');
 
   const phone = telefono || '5490000000000';
-  const lead  = queries.findLeadByPhone.get(phone);
-  const history = lead ? queries.getConversationHistory.all(lead.id) : [];
 
   try {
-    const result = await askClaude(mensaje, history);
+    const lead    = await queries.findLeadByPhone(phone);
+    const history = lead ? await queries.getConversationHistory(lead.id) : [];
+    const result  = await askClaude(mensaje, history);
 
-    // Guardar en DB igual que el flujo real (sin enviar a WhatsApp)
-    queries.upsertLeadAndSaveMessage(
+    const updatedLead = await queries.upsertLeadAndSaveMessage(
       { phone, name: result.lead_name, intent: result.intent,
         priority: result.priority, needs_lawyer: result.needs_lawyer, notes: result.notes },
       { wamid: `test_${Date.now()}`, direction: 'inbound', content: mensaje, intent: result.intent }
     );
-    const updatedLead = queries.findLeadByPhone.get(phone);
-    queries.saveMessage.run({
+    await queries.saveMessage({
       lead_id: updatedLead.id, wamid: null,
       direction: 'outbound', content: result.reply, intent: result.intent,
     });

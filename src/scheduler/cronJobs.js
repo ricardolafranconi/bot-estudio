@@ -97,6 +97,9 @@ function startAllJobs() {
   startFollowUpJob();
   startInactivityReminderJob();
   startStaleLeadsCleanupJob();
+
+  const { startReactivacionQueue } = require('./reactivacionQueue');
+  startReactivacionQueue();
 }
 
 module.exports = { startAllJobs };

@@ -99,4 +99,23 @@ function parseClaudeResponse(rawText) {
   }
 }
 
-module.exports = { askClaude };
+/**
+ * Llama a Claude con un prompt simple y retorna el texto crudo.
+ * Útil para análisis batch donde no se necesita el systemPrompt del bot.
+ */
+async function callClaude(prompt, maxTokens = 2048) {
+  let text = '';
+  const stream = anthropic.messages.stream({
+    model: 'claude-sonnet-4-6',
+    max_tokens: maxTokens,
+    messages: [{ role: 'user', content: prompt }],
+  });
+  for await (const event of stream) {
+    if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
+      text += event.delta.text;
+    }
+  }
+  return text;
+}
+
+module.exports = { askClaude, callClaude };

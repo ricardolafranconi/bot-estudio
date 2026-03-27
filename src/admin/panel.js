@@ -1,9 +1,14 @@
 'use strict';
 
-const express = require('express');
-const queries = require('../db/queries');
-const db = require('../db/database');
+const express  = require('express');
+const fs       = require('fs');
+const path     = require('path');
+const axios    = require('axios');
+const queries  = require('../db/queries');
+const db       = require('../db/database');
 const Anthropic = require('@anthropic-ai/sdk');
+const { generarPdfTelegrama }  = require('../utils/pdfTelegrama');
+const { generarPdfCartaPoder } = require('../utils/pdfCartaPoder');
 
 require('dotenv').config();
 
@@ -79,6 +84,18 @@ const PRIORITY_COLORS = { ALTA:'#ef4444', MEDIA:'#f59e0b', BAJA:'#6b7280' };
 const CASO_ESTADO_COLORS = {
   'Nuevo':'#3b82f6','En proceso':'#10b981',
   'Audiencia próxima':'#f59e0b','Sentencia':'#8b5cf6','Cerrado':'#6b7280',
+};
+
+const TIPOS_TELEGRAMA = {
+  registracion:       'Intimación por trabajo no registrado',
+  licencia_medica:    'Comunicación de licencia médica',
+  negativa_trabajo:   'Denuncia de negativa de trabajo / prohibición de ingreso',
+  pago_haberes:       'Intimación de pago de haberes',
+  despido_indirecto:  'Comunicación de despido indirecto',
+  respuesta_despido:  'Respuesta a despido directo',
+  accidente_trabajo:  'Intimación por accidente de trabajo',
+  embarazo:           'Comunicación de embarazo',
+  certificados_art80: 'Solicitud de certificados art. 80 LCT',
 };
 
 // ─── Claude AI helper ─────────────────────────────────────────────────────────
@@ -257,6 +274,7 @@ function LAYOUT(title, active, content) {
   <nav class="sidebar-nav">
     <a href="/admin" class="nav-item ${active==='leads'?'active':''}"><span class="ni">💬</span> Leads WhatsApp</a>
     <a href="/admin/estudio" class="nav-item ${active==='estudio'?'active':''}"><span class="ni">📁</span> Casos en Estudio</a>
+    <a href="/admin/reactivacion" class="nav-item"><span class="ni">📣</span> Reactivación</a>
   </nav>
   <div class="sidebar-footer">v2.0 · Panel Jurídico IA</div>
 </aside>
@@ -589,6 +607,206 @@ router.post('/estudio/:id/guardar-tarea', async (req, res) => {
 
 router.get('/api/stats', async (req, res) => res.json(await queries.getLeadStats()));
 
+// ─── GET  /admin/estudio/:id/telegramas ───────────────────────────────────────
+
+router.get('/estudio/:id/telegramas', async (req, res) => {
+  const { rows } = await db.query(
+    'SELECT * FROM telegramas WHERE caso_id=$1 ORDER BY created_at DESC',
+    [req.params.id]
+  );
+  res.json(rows);
+});
+
+// ─── POST /admin/estudio/:id/telegramas/extraer (IA) ─────────────────────────
+
+router.post('/estudio/:id/telegramas/extraer', async (req, res) => {
+  const { tipo } = req.body;
+  const { rows: cr } = await db.query('SELECT * FROM casos WHERE id=$1', [req.params.id]);
+  const caso = cr[0];
+  if (!caso) return res.status(404).json({ error: 'Caso no encontrado.' });
+
+  const mensajes = caso.lead_id
+    ? (await db.query('SELECT direction, content FROM messages WHERE lead_id=$1 ORDER BY created_at ASC', [caso.lead_id])).rows
+    : [];
+  const conv = mensajes.length
+    ? mensajes.map(m => `[${m.direction === 'inbound' ? 'Cliente' : 'Bot'}]: ${m.content}`).join('\n')
+    : `Nombre: ${caso.nombre||''}\nTipo: ${caso.tipo_caso||''}\nActor: ${caso.actor||''}\nDemandado: ${caso.demandado||''}\nResumen: ${caso.resumen||''}`;
+
+  const tipoLabel = TIPOS_TELEGRAMA[tipo] || tipo;
+  const hoy = new Date().toLocaleDateString('es-AR');
+
+  const prompt = `Sos un abogado experto en derecho laboral argentino especializado en la Ley de Contrato de Trabajo (LCT).
+
+Analizá la siguiente información de un caso y generá en JSON todos los datos para un telegrama laboral de tipo: "${tipoLabel}".
+
+INFORMACIÓN DEL CASO:
+${conv}
+
+Datos adicionales:
+- Nombre cliente: ${caso.nombre||'No disponible'}
+- Tipo de caso: ${caso.tipo_caso||'No disponible'}
+- Actor: ${caso.actor||'No disponible'}
+- Demandado: ${caso.demandado||'No disponible'}
+- Resumen: ${caso.resumen||'No disponible'}
+
+Respondé SOLO con JSON válido (sin bloques de código):
+{
+  "destinatario_nombre": "razón social o nombre del empleador",
+  "destinatario_ramo": "actividad principal del empleador",
+  "destinatario_domicilio": "domicilio laboral",
+  "destinatario_cp": "código postal",
+  "destinatario_localidad": "localidad",
+  "destinatario_provincia": "provincia",
+  "remitente_nombre": "nombre completo del trabajador",
+  "remitente_dni": "DNI del trabajador (si no está disponible: vacío)",
+  "remitente_domicilio": "domicilio real del trabajador",
+  "remitente_cp": "código postal del trabajador",
+  "remitente_localidad": "localidad del trabajador",
+  "remitente_provincia": "provincia del trabajador",
+  "fecha": "${hoy}",
+  "cuerpo_telegrama": "texto íntegro del telegrama, redactado en forma jurídica formal, citando artículos de la LCT y leyes pertinentes. Mínimo 30 palabras."
+}`;
+
+  try {
+    const raw  = await callClaude(prompt, 2048);
+    const data = parseJson(raw);
+    if (!data) return res.status(500).json({ error: 'No se pudo parsear la respuesta de IA.', raw });
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── POST /admin/estudio/:id/telegramas/crear ─────────────────────────────────
+
+router.post('/estudio/:id/telegramas/crear', async (req, res) => {
+  const { tipo, datos, cuerpo } = req.body;
+  const { rows } = await db.query(
+    `INSERT INTO telegramas (caso_id, tipo, estado, datos, cuerpo)
+     VALUES ($1, $2, 'borrador', $3, $4) RETURNING *`,
+    [req.params.id, tipo, JSON.stringify(datos || {}), cuerpo || '']
+  );
+  res.json(rows[0]);
+});
+
+// ─── POST /admin/telegramas/:tid/actualizar ───────────────────────────────────
+
+router.post('/telegramas/:tid/actualizar', async (req, res) => {
+  const { datos, cuerpo, estado } = req.body;
+  const { rows } = await db.query(
+    `UPDATE telegramas SET datos=$1, cuerpo=$2, estado=COALESCE($3,estado), updated_at=NOW()
+     WHERE id=$4 RETURNING *`,
+    [JSON.stringify(datos || {}), cuerpo || '', estado || null, req.params.tid]
+  );
+  res.json(rows[0]);
+});
+
+// ─── POST /admin/telegramas/:tid/estado ──────────────────────────────────────
+
+router.post('/telegramas/:tid/estado', async (req, res) => {
+  const { estado } = req.body;
+  await db.query('UPDATE telegramas SET estado=$1, updated_at=NOW() WHERE id=$2', [estado, req.params.tid]);
+  res.json({ ok: true });
+});
+
+// ─── GET  /admin/telegramas/:tid/pdf ─────────────────────────────────────────
+
+router.get('/telegramas/:tid/pdf', async (req, res) => {
+  const { rows } = await db.query('SELECT * FROM telegramas WHERE id=$1', [req.params.tid]);
+  const tele = rows[0];
+  if (!tele) return res.status(404).send('Telegrama no encontrado.');
+
+  const dir     = path.join(process.cwd(), 'uploads', 'telegramas', String(tele.caso_id));
+  const outPath = path.join(dir, `telegrama_${tele.id}.pdf`);
+  const datos   = Object.assign({}, tele.datos || {}, { cuerpo: tele.cuerpo });
+
+  await generarPdfTelegrama(datos, outPath);
+  await db.query('UPDATE telegramas SET pdf_path=$1, updated_at=NOW() WHERE id=$2', [outPath, tele.id]);
+
+  const label = (TIPOS_TELEGRAMA[tele.tipo] || tele.tipo || 'telegrama').replace(/[^a-zA-Z0-9]/g, '_');
+  res.download(outPath, `Telegrama_${label}_${tele.id}.pdf`);
+});
+
+// ─── POST /admin/telegramas/:tid/whatsapp ────────────────────────────────────
+
+router.post('/telegramas/:tid/whatsapp', async (req, res) => {
+  const { phone } = req.body;
+  const { rows } = await db.query(
+    'SELECT t.*, c.nombre, c.telefono FROM telegramas t JOIN casos c ON c.id=t.caso_id WHERE t.id=$1',
+    [req.params.tid]
+  );
+  const tele = rows[0];
+  if (!tele) return res.status(404).json({ error: 'Telegrama no encontrado.' });
+
+  const targetPhone = (phone || tele.telefono || '').replace(/\D/g, '');
+  if (!targetPhone) return res.status(400).json({ error: 'No hay teléfono disponible.' });
+
+  const dir     = path.join(process.cwd(), 'uploads', 'telegramas', String(tele.caso_id));
+  const outPath = path.join(dir, `telegrama_${tele.id}.pdf`);
+  const datos   = Object.assign({}, tele.datos || {}, { cuerpo: tele.cuerpo });
+  await generarPdfTelegrama(datos, outPath);
+
+  const PHONE_ID = process.env.WHATSAPP_PHONE_NUMBER_ID;
+  const TOKEN    = process.env.WHATSAPP_ACCESS_TOKEN;
+
+  // Upload media using Node 18+ built-in FormData + fetch
+  const fileBuffer = fs.readFileSync(outPath);
+  const blob = new Blob([fileBuffer], { type: 'application/pdf' });
+  const fd   = new FormData();
+  fd.append('file', blob, 'telegrama.pdf');
+  fd.append('type', 'application/pdf');
+  fd.append('messaging_product', 'whatsapp');
+
+  const uploadRes  = await fetch(`https://graph.facebook.com/v18.0/${PHONE_ID}/media`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${TOKEN}` },
+    body: fd,
+  });
+  const uploadData = await uploadRes.json();
+  if (!uploadData.id) return res.status(500).json({ error: 'Error al subir el archivo.', detail: uploadData });
+
+  const label = TIPOS_TELEGRAMA[tele.tipo] || tele.tipo || 'Telegrama';
+  const sendRes = await axios.post(
+    `https://graph.facebook.com/v18.0/${PHONE_ID}/messages`,
+    {
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: targetPhone,
+      type: 'document',
+      document: {
+        id: uploadData.id,
+        filename: `${label}.pdf`,
+        caption: `Adjuntamos el telegrama laboral generado por el ${process.env.ESTUDIO_NOMBRE||'Estudio Jurídico Lafranconi'}. Imprímalo, fírmelo y preséntelo en el Correo Argentino más cercano.`,
+      },
+    },
+    { headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' } }
+  );
+
+  await db.query("UPDATE telegramas SET estado='enviado', pdf_path=$1, updated_at=NOW() WHERE id=$2", [outPath, tele.id]);
+  res.json({ ok: true, wamid: sendRes.data?.messages?.[0]?.id });
+});
+
+// ─── DELETE /admin/telegramas/:tid ───────────────────────────────────────────
+
+router.delete('/telegramas/:tid', async (req, res) => {
+  const { rows } = await db.query('SELECT pdf_path FROM telegramas WHERE id=$1', [req.params.tid]);
+  if (rows[0]?.pdf_path) { try { fs.unlinkSync(rows[0].pdf_path); } catch {} }
+  await db.query('DELETE FROM telegramas WHERE id=$1', [req.params.tid]);
+  res.json({ ok: true });
+});
+
+// ─── GET  /admin/estudio/:id/carta-poder/pdf ─────────────────────────────────
+
+router.get('/estudio/:id/carta-poder/pdf', async (req, res) => {
+  const { rows } = await db.query('SELECT * FROM casos WHERE id=$1', [req.params.id]);
+  const caso = rows[0];
+  if (!caso) return res.status(404).send('Caso no encontrado.');
+  const dir     = path.join(process.cwd(), 'uploads', 'telegramas', String(caso.id));
+  const outPath = path.join(dir, 'carta_poder.pdf');
+  await generarPdfCartaPoder(caso, outPath);
+  res.download(outPath, `CartaPoder_${(caso.nombre||caso.id).replace(/[^a-zA-Z0-9]/g,'_')}.pdf`);
+});
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // HTML RENDERERS
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -604,12 +822,11 @@ function renderPanel(leads, stats, sf, inf) {
       <td style="color:var(--t2);font-size:13px">${l.message_count}</td>
       <td style="color:var(--t2);font-size:13px;max-width:180px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis">${escapeHtml(l.last_message||'—')}</td>
       <td style="color:var(--t3);font-size:12px">${l.last_message_at?l.last_message_at.substring(0,16):'—'}</td>
-      <td>
-        ${l.caso_id
-          ? `<a href="/admin/estudio/${l.caso_id}" class="btn btn-sm btn-glass">📁 Ver caso</a>`
-          : `<form method="POST" action="/admin/lead/${l.id}/pasar-a-estudio" style="display:inline">
-               <button type="submit" class="btn btn-sm btn-green">✨ Pasar a Estudio</button>
-             </form>`}
+      <td style="display:flex;gap:6px;flex-wrap:wrap;padding:10px 16px">
+        ${l.caso_id ? `<a href="/admin/estudio/${l.caso_id}" class="btn btn-sm btn-glass">📁 Ver caso</a>` : ''}
+        <form method="POST" action="/admin/lead/${l.id}/pasar-a-estudio" style="display:inline;margin:0">
+          <button type="submit" class="btn btn-sm btn-green">✨ Pasar a Estudio</button>
+        </form>
       </td>
     </tr>`).join('');
 
@@ -741,17 +958,12 @@ function renderCasoDetalle(caso, movimientos, mensajes) {
     </div>`).join('');
 
   const estadoColor = CASO_ESTADO_COLORS[caso.estado]||'#999';
+  const tiposOpts   = Object.entries(TIPOS_TELEGRAMA)
+    .map(([k,l]) => `<option value="${k}">${escapeHtml(l)}</option>`).join('');
 
-  const subheader = `
-    <div class="subheader">
-      <a href="/admin/estudio" class="btn btn-glass btn-sm">← Volver</a>
-      <span class="badge" style="background:${estadoColor}22;color:${estadoColor};border:1px solid ${estadoColor}44;font-size:13px">${v(caso.estado)}</span>
-      ${caso.lead_id?`<a href="/admin/lead/${caso.lead_id}" class="btn btn-glass btn-sm">💬 Conversación WhatsApp</a>`:''}
-      <span style="margin-left:auto;font-size:12px;color:var(--t3)">Creado: ${caso.created_at.substring(0,10)}</span>
-    </div>`;
+  // ── Tab: Datos del caso ───────────────────────────────────────────────────
 
   const mainCol = `
-    <!-- Datos del caso -->
     <div class="card">
       <div class="section-title">Datos del caso — ${v(caso.expediente)}</div>
       <form method="POST" action="/admin/estudio/${caso.id}/update">
@@ -795,27 +1007,18 @@ function renderCasoDetalle(caso, movimientos, mensajes) {
       </form>
     </div>
 
-    <!-- IA: Outline del caso -->
     <div class="card">
       <div class="section-title">🤖 Análisis con Inteligencia Artificial</div>
       <div style="display:flex;gap:12px;flex-wrap:wrap">
         <button class="btn btn-ai" onclick="generarOutline(${caso.id})">📋 Generar Outline del Caso</button>
         <button class="btn btn-primary" onclick="sugerirTarea(${caso.id})">⚡ Sugerir Próxima Tarea</button>
       </div>
-
-      <!-- Outline result -->
       <div class="ai-result" id="outline-panel">
-        <div id="outline-loading" class="ai-loading" style="display:none">
-          <span class="spinner"></span> Analizando el caso con IA...
-        </div>
+        <div id="outline-loading" style="display:none"><span class="spinner"></span> Analizando el caso con IA...</div>
         <div id="outline-content"></div>
       </div>
-
-      <!-- Task suggestion result -->
       <div class="task-result" id="task-panel">
-        <div id="task-loading" style="display:none;color:var(--t2);font-size:14px">
-          <span class="spinner"></span> Calculando próxima acción procesal...
-        </div>
+        <div id="task-loading" style="display:none;color:var(--t2);font-size:14px"><span class="spinner"></span> Calculando próxima acción procesal...</div>
         <div id="task-content"></div>
         <div id="task-actions" style="display:none;margin-top:16px">
           <button class="btn btn-primary btn-sm" onclick="guardarTarea()">💾 Guardar como próxima acción</button>
@@ -823,7 +1026,6 @@ function renderCasoDetalle(caso, movimientos, mensajes) {
       </div>
     </div>
 
-    <!-- Movimientos -->
     <div class="card" id="movimientos">
       <div class="section-title">Historial de movimientos</div>
       <form method="POST" action="/admin/estudio/${caso.id}/movimiento" style="display:grid;grid-template-columns:1fr auto auto;gap:10px;align-items:end;margin-bottom:20px">
@@ -848,18 +1050,372 @@ function renderCasoDetalle(caso, movimientos, mensajes) {
       <div style="font-size:13px">Sin conversación vinculada</div>
     </div>`;
 
+  // ── Tab: Telegramas ───────────────────────────────────────────────────────
+
+  const ESTADO_COLORS_TELE = { borrador:'#6b7280', revisado:'#f59e0b', enviado:'#10b981' };
+
+  const telegramasTab = `
+    <div style="padding:24px 32px">
+      <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:24px">
+        <button class="btn btn-primary" onclick="abrirModal(null)">📨 Generar Telegrama</button>
+        <a href="/admin/estudio/${caso.id}/carta-poder/pdf" class="btn btn-glass" target="_blank">📄 Generar Carta Poder</a>
+      </div>
+      <div class="card" style="padding:0;overflow:hidden">
+        <table style="margin:0;border:none;border-radius:0">
+          <thead><tr>
+            <th>Tipo de telegrama</th><th>Fecha</th><th>Estado</th><th>Acciones</th>
+          </tr></thead>
+          <tbody id="telegramas-tbody">
+            <tr><td colspan="4" class="empty" style="padding:32px">Cargando...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>`;
+
+  // Modal fuera del panel oculto para que position:fixed funcione correctamente
+  const modalTelegrama = `
+    <div id="tele-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:9999;align-items:flex-start;justify-content:center;padding:20px;overflow-y:auto">
+      <div style="background:#1a2744;border:1px solid var(--border);border-radius:var(--r);width:100%;max-width:760px;margin:auto;box-shadow:0 20px 60px rgba(0,0,0,0.5)">
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:20px 24px;border-bottom:1px solid var(--border)">
+          <div style="font-size:16px;font-weight:700;color:var(--t1)">📨 Telegrama Ley N° 23.789</div>
+          <button onclick="cerrarModal()" style="background:none;border:none;color:var(--t3);font-size:26px;cursor:pointer;line-height:1;padding:0 4px">×</button>
+        </div>
+        <div style="padding:24px;max-height:76vh;overflow-y:auto">
+          <div style="display:flex;gap:12px;align-items:flex-end;margin-bottom:20px">
+            <div class="field" style="flex:1;margin:0">
+              <label>Tipo de telegrama</label>
+              <select id="tele-tipo">${tiposOpts}</select>
+            </div>
+            <button id="tele-ia-btn" class="btn btn-ai" onclick="extraerConIA()" style="white-space:nowrap">✨ Analizar con IA</button>
+          </div>
+          <div style="background:rgba(255,255,255,0.04);border:1px solid var(--border);border-radius:var(--rs);padding:16px;margin-bottom:16px">
+            <div class="section-title" style="margin-bottom:12px">Destinatario (Empleador)</div>
+            <div class="grid2">
+              <div class="field"><label>Apellido y nombre / Razón social</label><input id="dest_nombre" placeholder="Ej: Angel Jorge Stasiuk"></div>
+              <div class="field"><label>Ramo / Actividad</label><input id="dest_ramo" placeholder="Ej: Aserradero — elaboración de pino"></div>
+            </div>
+            <div class="grid3">
+              <div class="field"><label>Domicilio laboral</label><input id="dest_domicilio" placeholder="Calle y número"></div>
+              <div class="field"><label>Código Postal</label><input id="dest_cp" placeholder="3360"></div>
+              <div class="field"><label>Localidad</label><input id="dest_localidad" placeholder="Oberá"></div>
+            </div>
+            <div class="field"><label>Provincia</label><input id="dest_provincia" value="Misiones"></div>
+          </div>
+          <div style="background:rgba(255,255,255,0.04);border:1px solid var(--border);border-radius:var(--rs);padding:16px;margin-bottom:16px">
+            <div class="section-title" style="margin-bottom:12px">Remitente (Trabajador)</div>
+            <div class="grid2">
+              <div class="field"><label>Apellido y nombre</label><input id="rem_nombre" placeholder="Nombre del trabajador"></div>
+              <div class="field"><label>DNI N°</label><input id="rem_dni" placeholder="30.123.456"></div>
+            </div>
+            <div class="grid3">
+              <div class="field"><label>Domicilio real</label><input id="rem_domicilio" placeholder="Calle y número"></div>
+              <div class="field"><label>Código Postal</label><input id="rem_cp" placeholder="3360"></div>
+              <div class="field"><label>Localidad</label><input id="rem_localidad" placeholder="Oberá"></div>
+            </div>
+            <div class="field"><label>Provincia</label><input id="rem_provincia" value="Misiones"></div>
+          </div>
+          <div class="field">
+            <label>Texto del telegrama</label>
+            <textarea id="tele_cuerpo" rows="8" placeholder="La IA completará este campo automáticamente. También podés escribirlo manualmente." style="font-size:13px;line-height:1.6"></textarea>
+          </div>
+          <div class="field" id="tele-estado-field" style="display:none">
+            <label>Estado</label>
+            <select id="tele-estado-sel">
+              <option value="borrador">Borrador</option>
+              <option value="revisado">Revisado</option>
+              <option value="enviado">Enviado al cliente</option>
+            </select>
+          </div>
+        </div>
+        <div style="padding:16px 24px;border-top:1px solid var(--border);display:flex;gap:10px;flex-wrap:wrap;justify-content:flex-end">
+          <button onclick="cerrarModal()" class="btn btn-glass">Cancelar</button>
+          <button id="tele-save-btn" class="btn btn-primary" onclick="guardarTelegrama()">💾 Guardar borrador</button>
+          <a id="tele-pdf-btn" class="btn btn-glass" href="#" target="_blank" style="display:none">📥 Descargar PDF</a>
+          <button id="tele-wa-btn" class="btn btn-green" onclick="enviarWA(null,'${v(caso.telefono)}')" style="display:none">📲 Enviar por WhatsApp</button>
+        </div>
+      </div>
+    </div>`;
+
+  // ── Full page content ─────────────────────────────────────────────────────
+
   const content = `
-    ${subheader}
-    <div class="container-2col">
-      <div>${mainCol}</div>
-      <div>${sideCol}</div>
+    <div class="subheader">
+      <a href="/admin/estudio" class="btn btn-glass btn-sm">← Volver</a>
+      <span class="badge" style="background:${estadoColor}22;color:${estadoColor};border:1px solid ${estadoColor}44;font-size:13px">${v(caso.estado)}</span>
+      ${caso.lead_id?`<a href="/admin/lead/${caso.lead_id}" class="btn btn-glass btn-sm">💬 Conversación WhatsApp</a>`:''}
+      <span style="margin-left:auto;font-size:12px;color:var(--t3)">Creado: ${caso.created_at.substring(0,10)}</span>
     </div>
 
+    <!-- Tab bar -->
+    <div style="padding:0 32px;display:flex;gap:0;border-bottom:1px solid var(--border);background:rgba(10,17,35,0.5)">
+      <button id="tab-btn-datos"      onclick="showTab('datos')"
+        style="padding:14px 22px;font-size:14px;font-weight:600;color:var(--gold);background:none;border:none;border-bottom:2px solid var(--gold);cursor:pointer">
+        📋 Datos del caso
+      </button>
+      <button id="tab-btn-telegramas" onclick="showTab('telegramas')"
+        style="padding:14px 22px;font-size:14px;font-weight:500;color:var(--t2);background:none;border:none;border-bottom:2px solid transparent;cursor:pointer">
+        📨 Telegramas
+      </button>
+    </div>
+
+    <!-- Panel: Datos -->
+    <div id="panel-datos">
+      <div class="container-2col">
+        <div>${mainCol}</div>
+        <div>${sideCol}</div>
+      </div>
+    </div>
+
+    <!-- Panel: Telegramas -->
+    <div id="panel-telegramas" style="display:none">
+      ${telegramasTab}
+    </div>
+
+    ${modalTelegrama}
+
     <script>
+    // ── Tabs ──────────────────────────────────────────────────────────────────
+    function showTab(tab) {
+      document.getElementById('panel-datos').style.display      = tab==='datos'      ? '' : 'none';
+      document.getElementById('panel-telegramas').style.display = tab==='telegramas' ? '' : 'none';
+      const gBtn = id => document.getElementById('tab-btn-' + id);
+      gBtn('datos').style.borderBottom      = tab==='datos'      ? '2px solid var(--gold)' : '2px solid transparent';
+      gBtn('datos').style.color             = tab==='datos'      ? 'var(--gold)' : 'var(--t2)';
+      gBtn('datos').style.fontWeight        = tab==='datos'      ? '600' : '500';
+      gBtn('telegramas').style.borderBottom = tab==='telegramas' ? '2px solid var(--gold)' : '2px solid transparent';
+      gBtn('telegramas').style.color        = tab==='telegramas' ? 'var(--gold)' : 'var(--t2)';
+      gBtn('telegramas').style.fontWeight   = tab==='telegramas' ? '600' : '500';
+      if (tab==='telegramas') cargarTelegramas();
+    }
+
+    // ── Telegramas CRUD ───────────────────────────────────────────────────────
+    let currentTelegramaId = null;
+
+    const TIPOS_TELE = {
+      registracion:'Intimación por trabajo no registrado',
+      licencia_medica:'Comunicación de licencia médica',
+      negativa_trabajo:'Denuncia de negativa de trabajo / prohibición de ingreso',
+      pago_haberes:'Intimación de pago de haberes',
+      despido_indirecto:'Comunicación de despido indirecto',
+      respuesta_despido:'Respuesta a despido directo',
+      accidente_trabajo:'Intimación por accidente de trabajo',
+      embarazo:'Comunicación de embarazo',
+      certificados_art80:'Solicitud de certificados art. 80 LCT',
+    };
+
+    const ESTADO_COL = { borrador:'#6b7280', revisado:'#f59e0b', enviado:'#10b981' };
+
+    async function cargarTelegramas() {
+      const tbody = document.getElementById('telegramas-tbody');
+      tbody.innerHTML = '<tr><td colspan="4" class="empty" style="padding:28px">Cargando...</td></tr>';
+      try {
+        const r    = await fetch('/admin/estudio/${caso.id}/telegramas');
+        const list = await r.json();
+        if (!list.length) {
+          tbody.innerHTML = '<tr><td colspan="4" class="empty" style="padding:32px">No hay telegramas generados. Hacé clic en "Generar Telegrama" para crear uno.</td></tr>';
+          return;
+        }
+        tbody.innerHTML = list.map(t => {
+          const col   = ESTADO_COL[t.estado]||'#999';
+          const label = TIPOS_TELE[t.tipo]||t.tipo;
+          const fecha = (t.created_at||'').substring(0,10);
+          return '<tr>'
+            + '<td style="font-size:13px">'+escHtml(label)+'</td>'
+            + '<td style="font-size:13px;color:var(--t3)">'+fecha+'</td>'
+            + '<td><span class="badge" style="background:'+col+'22;color:'+col+';border:1px solid '+col+'44">'+escHtml(t.estado)+'</span></td>'
+            + '<td style="display:flex;gap:6px;flex-wrap:wrap;padding:10px 16px">'
+            +   '<button class="btn btn-sm btn-glass" onclick="editarTelegrama('+t.id+')">✏️ Ver/Editar</button>'
+            +   '<a href="/admin/telegramas/'+t.id+'/pdf" class="btn btn-sm btn-glass" target="_blank">📥 PDF</a>'
+            +   '<button class="btn btn-sm btn-green" onclick="enviarWA('+t.id+', null)">📲 WhatsApp</button>'
+            +   '<button class="btn btn-sm" style="background:rgba(239,68,68,0.15);color:#fca5a5;border:1px solid rgba(239,68,68,0.3)" onclick="eliminarTelegrama('+t.id+')">🗑️</button>'
+            + '</td></tr>';
+        }).join('');
+      } catch(e) {
+        tbody.innerHTML = '<tr><td colspan="4" class="empty">Error: '+escHtml(e.message)+'</td></tr>';
+      }
+    }
+
+    function abrirModal(id) {
+      currentTelegramaId = id || null;
+      if (!id) resetModal();
+      document.getElementById('tele-modal').style.display = 'flex';
+      document.getElementById('tele-pdf-btn').style.display  = id ? 'inline-flex' : 'none';
+      document.getElementById('tele-wa-btn').style.display   = id ? 'inline-flex' : 'none';
+      document.getElementById('tele-estado-field').style.display = id ? '' : 'none';
+    }
+
+    function cerrarModal() {
+      document.getElementById('tele-modal').style.display = 'none';
+      currentTelegramaId = null;
+    }
+
+    function resetModal() {
+      document.getElementById('tele-tipo').value = 'registracion';
+      ['dest_nombre','dest_ramo','dest_domicilio','dest_cp','dest_localidad',
+       'rem_nombre','rem_dni','rem_domicilio','rem_cp','rem_localidad','tele_cuerpo']
+        .forEach(id => { document.getElementById(id).value = ''; });
+      document.getElementById('dest_provincia').value = 'Misiones';
+      document.getElementById('rem_provincia').value  = 'Misiones';
+    }
+
+    async function editarTelegrama(id) {
+      const r    = await fetch('/admin/estudio/${caso.id}/telegramas');
+      const list = await r.json();
+      const t    = list.find(x => x.id === id);
+      if (!t) return;
+      currentTelegramaId = id;
+      const d = t.datos || {};
+      document.getElementById('tele-tipo').value         = t.tipo || 'registracion';
+      document.getElementById('dest_nombre').value       = d.destinatario_nombre    || '';
+      document.getElementById('dest_ramo').value         = d.destinatario_ramo      || '';
+      document.getElementById('dest_domicilio').value    = d.destinatario_domicilio || '';
+      document.getElementById('dest_cp').value           = d.destinatario_cp        || '';
+      document.getElementById('dest_localidad').value    = d.destinatario_localidad || '';
+      document.getElementById('dest_provincia').value    = d.destinatario_provincia || 'Misiones';
+      document.getElementById('rem_nombre').value        = d.remitente_nombre    || '';
+      document.getElementById('rem_dni').value           = d.remitente_dni       || '';
+      document.getElementById('rem_domicilio').value     = d.remitente_domicilio || '';
+      document.getElementById('rem_cp').value            = d.remitente_cp        || '';
+      document.getElementById('rem_localidad').value     = d.remitente_localidad || '';
+      document.getElementById('rem_provincia').value     = d.remitente_provincia || 'Misiones';
+      document.getElementById('tele_cuerpo').value       = t.cuerpo || '';
+      document.getElementById('tele-estado-sel').value   = t.estado || 'borrador';
+      document.getElementById('tele-modal').style.display = 'flex';
+      document.getElementById('tele-pdf-btn').style.display  = 'inline-flex';
+      document.getElementById('tele-wa-btn').style.display   = 'inline-flex';
+      document.getElementById('tele-estado-field').style.display = '';
+      const pdfBtn = document.getElementById('tele-pdf-btn');
+      pdfBtn.href = '/admin/telegramas/' + id + '/pdf';
+    }
+
+    async function extraerConIA() {
+      const tipo = document.getElementById('tele-tipo').value;
+      const btn  = document.getElementById('tele-ia-btn');
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span> Analizando...';
+      try {
+        const r = await fetch('/admin/estudio/${caso.id}/telegramas/extraer', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tipo }),
+        });
+        const d = await r.json();
+        if (d.error) { alert('Error IA: ' + d.error); return; }
+        document.getElementById('dest_nombre').value    = d.destinatario_nombre    || '';
+        document.getElementById('dest_ramo').value      = d.destinatario_ramo      || '';
+        document.getElementById('dest_domicilio').value = d.destinatario_domicilio || '';
+        document.getElementById('dest_cp').value        = d.destinatario_cp        || '';
+        document.getElementById('dest_localidad').value = d.destinatario_localidad || '';
+        document.getElementById('dest_provincia').value = d.destinatario_provincia || 'Misiones';
+        document.getElementById('rem_nombre').value     = d.remitente_nombre    || '';
+        document.getElementById('rem_dni').value        = d.remitente_dni       || '';
+        document.getElementById('rem_domicilio').value  = d.remitente_domicilio || '';
+        document.getElementById('rem_cp').value         = d.remitente_cp        || '';
+        document.getElementById('rem_localidad').value  = d.remitente_localidad || '';
+        document.getElementById('rem_provincia').value  = d.remitente_provincia || 'Misiones';
+        document.getElementById('tele_cuerpo').value    = d.cuerpo_telegrama    || '';
+      } catch(e) {
+        alert('Error: ' + e.message);
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = '✨ Analizar con IA';
+      }
+    }
+
+    function getDatos() {
+      return {
+        destinatario_nombre:    document.getElementById('dest_nombre').value,
+        destinatario_ramo:      document.getElementById('dest_ramo').value,
+        destinatario_domicilio: document.getElementById('dest_domicilio').value,
+        destinatario_cp:        document.getElementById('dest_cp').value,
+        destinatario_localidad: document.getElementById('dest_localidad').value,
+        destinatario_provincia: document.getElementById('dest_provincia').value,
+        remitente_nombre:    document.getElementById('rem_nombre').value,
+        remitente_dni:       document.getElementById('rem_dni').value,
+        remitente_domicilio: document.getElementById('rem_domicilio').value,
+        remitente_cp:        document.getElementById('rem_cp').value,
+        remitente_localidad: document.getElementById('rem_localidad').value,
+        remitente_provincia: document.getElementById('rem_provincia').value,
+      };
+    }
+
+    async function guardarTelegrama() {
+      const tipo   = document.getElementById('tele-tipo').value;
+      const cuerpo = document.getElementById('tele_cuerpo').value;
+      const datos  = getDatos();
+      const estado = document.getElementById('tele-estado-sel')?.value || null;
+      const btn    = document.getElementById('tele-save-btn');
+      btn.disabled = true; btn.textContent = 'Guardando...';
+      try {
+        let saved;
+        if (currentTelegramaId) {
+          const r = await fetch('/admin/telegramas/' + currentTelegramaId + '/actualizar', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ datos, cuerpo, estado }),
+          });
+          saved = await r.json();
+        } else {
+          const r = await fetch('/admin/estudio/${caso.id}/telegramas/crear', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tipo, datos, cuerpo }),
+          });
+          saved = await r.json();
+          currentTelegramaId = saved.id;
+        }
+        btn.textContent = '✅ Guardado';
+        btn.style.background = 'linear-gradient(135deg,#10b981,#059669)';
+        document.getElementById('tele-pdf-btn').style.display = 'inline-flex';
+        document.getElementById('tele-pdf-btn').href = '/admin/telegramas/' + currentTelegramaId + '/pdf';
+        document.getElementById('tele-wa-btn').style.display = 'inline-flex';
+        document.getElementById('tele-estado-field').style.display = '';
+        cargarTelegramas();
+        setTimeout(() => { btn.textContent = '💾 Guardar'; btn.style.background = ''; btn.disabled = false; }, 2500);
+      } catch(e) {
+        alert('Error al guardar: ' + e.message);
+        btn.textContent = '💾 Guardar'; btn.disabled = false;
+      }
+    }
+
+    async function enviarWA(id, defaultPhone) {
+      const tid   = id || currentTelegramaId;
+      if (!tid) { alert('Guardá el telegrama primero.'); return; }
+      const phone = prompt('Número de WhatsApp (con código de país, sin +):\\nEj: 5493755123456', defaultPhone || '');
+      if (!phone) return;
+      const btn = id ? null : document.getElementById('tele-wa-btn');
+      if (btn) { btn.disabled = true; btn.textContent = 'Enviando...'; }
+      try {
+        const r = await fetch('/admin/telegramas/' + tid + '/whatsapp', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ phone }),
+        });
+        const d = await r.json();
+        if (d.ok) {
+          alert('Telegrama enviado por WhatsApp exitosamente.');
+          cargarTelegramas();
+        } else {
+          alert('Error al enviar: ' + (d.error || JSON.stringify(d)));
+        }
+      } catch(e) {
+        alert('Error: ' + e.message);
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '📲 Enviar por WhatsApp'; }
+      }
+    }
+
+    async function eliminarTelegrama(id) {
+      if (!confirm('¿Eliminar este telegrama?')) return;
+      await fetch('/admin/telegramas/' + id, { method: 'DELETE' });
+      cargarTelegramas();
+    }
+
+    // ── Outline / Tarea IA ────────────────────────────────────────────────────
     let taskSuggestion = null;
 
     async function generarOutline(id) {
-      const panel = document.getElementById('outline-panel');
+      const panel   = document.getElementById('outline-panel');
       const loading = document.getElementById('outline-loading');
       const content = document.getElementById('outline-content');
       panel.classList.add('show');
@@ -878,25 +1434,20 @@ function renderCasoDetalle(caso, movimientos, mensajes) {
     }
 
     function renderOutline(d) {
-      const list = (arr) => arr&&arr.length ? '<ul class="outline-body"><li>'+arr.map(escHtml).join('</li><li>')+'</li></ul>' : '<p class="outline-body">—</p>';
+      const list = arr => arr&&arr.length ? '<ul class="outline-body"><li>'+arr.map(escHtml).join('</li><li>')+'</li></ul>' : '<p class="outline-body">—</p>';
       return \`
-        <div class="outline-h">📌 Encuadre Legal</div>
-        <p class="outline-body">\${escHtml(d.encuadre_legal||'')}</p>
-        <div class="outline-h">📖 Artículos aplicables</div>
-        \${list(d.articulos_aplicables)}
+        <div class="outline-h">📌 Encuadre Legal</div><p class="outline-body">\${escHtml(d.encuadre_legal||'')}</p>
+        <div class="outline-h">📖 Artículos aplicables</div>\${list(d.articulos_aplicables)}
         <div class="outline-h">🗺️ Estrategia procesal</div>
         <ol class="outline-body" style="padding-left:20px">\${(d.estrategia_procesal||[]).map(s=>'<li style="margin-bottom:6px">'+escHtml(s)+'</li>').join('')}</ol>
-        <div class="outline-h">📂 Documentación necesaria</div>
-        \${list(d.documentacion_necesaria)}
-        <div class="outline-h">⚠️ Posibles obstáculos</div>
-        \${list(d.posibles_obstaculos)}
-        <div class="outline-h">⏱️ Estimación de duración</div>
-        <p class="outline-body">\${escHtml(d.estimacion_duracion||'')}</p>
+        <div class="outline-h">📂 Documentación necesaria</div>\${list(d.documentacion_necesaria)}
+        <div class="outline-h">⚠️ Posibles obstáculos</div>\${list(d.posibles_obstaculos)}
+        <div class="outline-h">⏱️ Estimación de duración</div><p class="outline-body">\${escHtml(d.estimacion_duracion||'')}</p>
       \`;
     }
 
     async function sugerirTarea(id) {
-      const panel = document.getElementById('task-panel');
+      const panel   = document.getElementById('task-panel');
       const loading = document.getElementById('task-loading');
       const content = document.getElementById('task-content');
       const actions = document.getElementById('task-actions');
@@ -928,27 +1479,20 @@ function renderCasoDetalle(caso, movimientos, mensajes) {
     async function guardarTarea() {
       if (!taskSuggestion) return;
       const btn = document.querySelector('#task-actions button');
-      btn.disabled = true;
-      btn.textContent = 'Guardando...';
-      // Fill the form fields too
+      btn.disabled = true; btn.textContent = 'Guardando...';
       const inputAccion = document.getElementById('proxima_accion_input');
       const inputFecha  = document.getElementById('proxima_fecha_input');
       if (inputAccion) inputAccion.value = taskSuggestion.accion || '';
-      if (inputFecha  && taskSuggestion.fecha_vencimiento) inputFecha.value = taskSuggestion.fecha_vencimiento;
-
+      if (inputFecha && taskSuggestion.fecha_vencimiento) inputFecha.value = taskSuggestion.fecha_vencimiento;
       try {
         const fd = new FormData();
         fd.append('proxima_accion', taskSuggestion.accion||'');
-        fd.append('proxima_fecha', taskSuggestion.fecha_vencimiento||'');
+        fd.append('proxima_fecha',  taskSuggestion.fecha_vencimiento||'');
         const r = await fetch('/admin/estudio/${caso.id}/guardar-tarea', {method:'POST', body: fd});
         const d = await r.json();
-        if (d.ok) {
-          btn.textContent = '✅ Guardado';
-          btn.style.background = 'linear-gradient(135deg,#10b981,#059669)';
-        }
+        if (d.ok) { btn.textContent = '✅ Guardado'; btn.style.background = 'linear-gradient(135deg,#10b981,#059669)'; }
       } catch(e) {
-        btn.textContent = 'Error al guardar';
-        btn.disabled = false;
+        btn.textContent = 'Error al guardar'; btn.disabled = false;
       }
     }
 
